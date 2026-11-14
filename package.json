@@ -1,0 +1,16 @@
+{
+  "name": "bridgequest-duplicate-server",
+  "version": "1.0.0",
+  "description": "Shared deals and matchpoint results for Bridge Quest duplicate MiniBridge",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.13.0"
+  }
+}
