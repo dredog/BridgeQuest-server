@@ -43,6 +43,13 @@ function createApp(pool, state = { problem: null }) {
       detail jsonb,
       PRIMARY KEY (board_id, user_key))`);
     await q(`CREATE INDEX IF NOT EXISTS plays_user ON plays (user_key)`);
+    // lesson progress: one row per player profile (the app's own player id), holding that player's lesson results
+    await q(`CREATE TABLE IF NOT EXISTS progress (
+      player_id text PRIMARY KEY,
+      name text NOT NULL,
+      avatar text,
+      data jsonb NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now())`);
   }
   const currentSeason = async () => +(await q(`SELECT value FROM meta WHERE key = 'season'`)).rows[0].value;
   async function seasonOf(req) {
@@ -104,7 +111,7 @@ function createApp(pool, state = { problem: null }) {
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
   });
-  app.use(express.json({ limit: '50kb' }));
+  app.use(express.json({ limit: '300kb' }));
   const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
   const NAME_HELP = 'Pick a username of 1 to 20 letters and numbers (no spaces).';
 
@@ -200,6 +207,25 @@ function createApp(pool, state = { problem: null }) {
     res.json({ game, season, boards: new Set(rows.map((r) => r.board_id)).size, players });
   });
 
+  /* ---------- lesson progress (the tutorial part of the app) ----------
+     The app sends a player's whole lesson record each time they finish a lesson; the newest copy replaces the old one. */
+  app.post('/api/progress', async (req, res) => {
+    const b = req.body || {};
+    const id = String(b.id || ''), name = String(b.name || '').trim().slice(0, 40), avatar = String(b.avatar || '').slice(0, 16);
+    if (!/^[A-Za-z0-9_-]{4,40}$/.test(id)) return bad(res, 'id is missing or not valid.');
+    if (!name) return bad(res, 'name is missing.');
+    if (!b.results || typeof b.results !== 'object' || Array.isArray(b.results)) return bad(res, 'results must be an object.');
+    const data = JSON.stringify({ results: b.results, mini: b.mini && typeof b.mini === 'object' ? b.mini : null });
+    await q(`INSERT INTO progress (player_id, name, avatar, data) VALUES ($1, $2, $3, $4)
+      ON CONFLICT (player_id) DO UPDATE SET name = EXCLUDED.name, avatar = EXCLUDED.avatar, data = EXCLUDED.data, updated_at = now()`, [id, name, avatar, data]);
+    res.json({ saved: true });
+  });
+  // everyone's lesson progress, most recently active first
+  app.get('/api/progress', async (req, res) => {
+    const rows = (await q(`SELECT player_id, name, avatar, data, updated_at FROM progress ORDER BY updated_at DESC LIMIT 2000`)).rows;
+    res.json({ players: rows.map((r) => ({ id: r.player_id, name: r.name, avatar: r.avatar, results: r.data.results || {}, mini: r.data.mini || null, updatedAt: r.updated_at })) });
+  });
+
   /* ---------- teacher-only calls (need the ADMIN_KEY setting) ---------- */
   const admin = (req, res, next) => (ADMIN_KEY && req.get('X-Admin-Key') === ADMIN_KEY ? next() : bad(res, 'Admin key missing or wrong.', 401));
   // start a fresh set of boards; the old season's boards and results are kept and can still be looked at with ?season=
@@ -207,6 +233,11 @@ function createApp(pool, state = { problem: null }) {
     const season = (await currentSeason()) + 1;
     await q(`UPDATE meta SET value = $1 WHERE key = 'season'`, [String(season)]);
     res.json({ season });
+  });
+  // remove one player from the lesson-progress list (for test entries); the id comes from GET /api/progress
+  app.post('/api/admin/progress/delete', admin, async (req, res) => {
+    const r = await q(`DELETE FROM progress WHERE player_id = $1`, [String((req.body && req.body.id) || '')]);
+    res.json({ deleted: r.rowCount });
   });
   // add a deal you chose yourself (for targeted practice or the full bridge game later)
   app.post('/api/admin/boards', admin, async (req, res) => {
