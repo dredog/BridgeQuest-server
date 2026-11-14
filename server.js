@@ -11,7 +11,8 @@ const PORT = process.env.PORT || 3000;
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const GAMES = ['mini', 'bridge'];              // 'bridge' is reserved for the full game later
 
-function createApp(pool) {
+// state.problem is a plain-English reason the database is not usable yet (null once it is)
+function createApp(pool, state = { problem: null }) {
   const q = (text, params) => pool.query(text, params);
 
   /* ---------- database ---------- */
@@ -107,6 +108,12 @@ function createApp(pool) {
   const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
   const NAME_HELP = 'Pick a username of 1 to 20 letters and numbers (no spaces).';
 
+  // Until the database is connected the server stays up and says what is wrong, instead of crashing.
+  app.use((req, res, next) => {
+    if (!state.problem) return next();
+    if (req.path.startsWith('/api/')) return bad(res, 'The server is not ready: ' + state.problem, 503);
+    res.status(503).type('text').send('NOT READY\n\n' + state.problem + '\n');
+  });
   app.get('/', (req, res) => res.type('text').send('Bridge Quest duplicate server is running.'));
   app.get('/health', async (req, res) => { await q('SELECT 1'); res.type('text').send('ok'); });
 
@@ -217,12 +224,48 @@ function createApp(pool) {
   return { app, init };
 }
 
-if (require.main === module) {
-  if (!process.env.DATABASE_URL) { console.error('DATABASE_URL is not set. In Railway: add a Postgres database, then add a reference variable DATABASE_URL to this service.'); process.exit(1); }
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-  const { app, init } = createApp(pool);
-  init().then(() => app.listen(PORT, '0.0.0.0', () => console.log(`Bridge Quest duplicate server listening on port ${PORT}`)))
-    .catch((e) => { console.error('Could not start:', e.message); process.exit(1); });
+/* Turn a database error into something a person can act on (and never print the password). */
+function explain(url, e) {
+  const msg = (e && e.message) || String(e), code = e && e.code;
+  let host = '';
+  try { host = new URL(url).hostname; } catch (x) { /* not a web-style address at all */ }
+  if (!url) return 'DATABASE_URL is not set.\nIn Railway: click this server service -> Variables -> New Variable -> Add Reference -> choose DATABASE_URL from your Postgres service. (Add it on the SERVER service, not on the database.)';
+  if (url.includes('${{') || !/^postgres(ql)?:\/\//.test(url)) return 'DATABASE_URL is set, but it is not a database address (it starts with "' + url.slice(0, 12) + '...").\nThe reference probably did not resolve. In Railway: delete the DATABASE_URL variable on this service and add it again with Add Reference, picking DATABASE_URL from the Postgres service in the list.';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'Cannot find the database server "' + host + '".\nThe Postgres service must be in the SAME Railway project and environment as this server. If it is, this usually clears by itself within a minute of a deploy.';
+  if (code === 'ECONNREFUSED' || code === 'ETIMEDOUT' || /timeout/i.test(msg)) return 'The database server "' + host + '" is not answering yet. Check the Postgres service is running (green) in Railway.';
+  if (code === '28P01' || code === '28000') return 'The database refused the password. In Railway: delete the DATABASE_URL variable on this service and add it again with Add Reference.';
+  if (code === '3D000') return 'The database named in DATABASE_URL does not exist. Re-add DATABASE_URL with Add Reference from the Postgres service.';
+  return 'Database problem: ' + msg;
 }
 
-module.exports = { createApp };
+if (require.main === module) {
+  const url = (process.env.DATABASE_URL || '').trim();
+  const state = { problem: 'Connecting to the database...' };
+  const usable = /^postgres(ql)?:\/\//.test(url) && !url.includes('${{');
+  const pool = new Pool(usable ? { connectionString: url, connectionTimeoutMillis: 10000 } : { host: '127.0.0.1', port: 1, connectionTimeoutMillis: 1000 });
+  pool.on('error', (e) => console.error('Database connection dropped (it will reconnect):', e.message));   // without this, a dropped connection would crash the server
+  process.on('unhandledRejection', (e) => console.error('Unexpected error:', e && e.message ? e.message : e));
+  const { app, init } = createApp(pool, state);
+  app.listen(PORT, '0.0.0.0', () => console.log(`Bridge Quest duplicate server listening on port ${PORT}`));
+  // Keep trying to reach the database.  The server answers /health with the reason while it waits.
+  (async () => {
+    let last = '';
+    for (let attempt = 1; ; attempt++) {
+      try {
+        if (!usable) throw new Error('bad DATABASE_URL');
+        await init();
+        state.problem = null;
+        console.log('Database ready. Everything is working.');
+        return;
+      } catch (e) {
+        state.problem = explain(url, e);
+        if (state.problem !== last || attempt % 12 === 0) console.error(`NOT READY (try ${attempt}): ${state.problem}`);
+        last = state.problem;
+        if (!usable) return;                        // nothing will change until the variable is fixed and the service redeploys
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+  })();
+}
+
+module.exports = { createApp, explain };
